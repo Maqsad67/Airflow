@@ -1,0 +1,652 @@
+from __future__ import annotations
+import csv
+import hashlib
+import io
+import logging
+import re
+import stat
+from contextlib import contextmanager
+import time
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.sensors.python import PythonSensor
+from airflow.providers.sftp.hooks.sftp import SFTPHook
+from airflow.utils.trigger_rule import TriggerRule
+from utils.bootstrap import bootstrap_process_group
+from utils.oracle_util import get_oracle_hook
+from utils.process_run_util import end_process_success, fail_process_run
+from utils.wrapper_util import stage_wrapper
+from constants.process import Process
+log = logging.getLogger(__name__)
+# =========================== config ===========================
+SFTP_CONN_ID = "sftp"
+SPOOL_DIR = "/media/FinCore/datafix"          # where the spool extracts land
+PARSED_DIR = "/media/FinCore/spool-parsed"    # <-- ADJUST: where clean CSV + .sql go
+# gl_transactions target
+TARGET_TABLE = "gl_transactions"
+TARGET_SEQ = "GL_TRANSACTIONS_SEQ"
+SOURCE_FLAG = "J"
+INSERT_COLUMNS = (
+   "TRANSACTION_ID,BATCH_ID,JOURNAL_ID,TRANSACTION_DATE,POST_DATE,BRANCH_CODE,"
+   "CURRENCY,CGL,NARRATION,DEBIT_AMOUNT,CREDIT_AMOUNT,TRANSACTION_COUNT,SOURCE_FLAG"
+)
+REFER_BASE = 999999        # posting date yymmdd = REFER_BASE - gdet_refer
+# Oracle id generators. Zero-arg functions are called without parentheses in SQL;
+# add them (and bind parameters) here if the signatures differ.
+BATCH_ID_SQL = "SELECT get_next_batch_id FROM dual"
+JOURNAL_ID_SQL = "SELECT get_next_journal_id FROM dual"
+# Only the file for this run's ETL date: fix_YYYYMMDD.txt
+SPOOL_RE = re.compile(r"^(?P<stem>fix_(?P<date>\d{8}))\.txt$", re.IGNORECASE)
+
+def spool_filename(etl_compact: str) -> str:
+   return f"fix_{etl_compact}.txt"
+
+# bootstrap_process pushes formatted_date as %Y%m%d - exactly the filename form.
+BOOTSTRAP_DATE_TASK = "bootstrap_process.fetch_fincore_etl_date"
+COLUMNS = [
+   "gdet_invc",
+   "gdet_entity",
+   "gdet_acct",
+   "gdet_curr",
+   "gdet_desc",
+   "gdet_amt",
+   "gdet_refer",
+]
+NUMERIC = {"gdet_amt"}
+ROW_RE = re.compile(r"^\s*(BU\d{8})\s*\|(.*)$")
+FOOTER_RE = re.compile(r"^\s*(\d+)\s+rows?\s+selected\.?\s*$", re.IGNORECASE)
+# =========================== parser ===========================
+def _to_decimal(text: str):
+   """Oracle writes '.6', '-.5', '418467821.38'. Decimal keeps money exact."""
+   if not text:
+       return None
+   try:
+       return Decimal(text)
+   except InvalidOperation:
+       return None
+
+def parse_spool(lines) -> tuple[list[dict], dict]:
+   """Return (rows, stats). stats carries the integrity numbers."""
+   rows: list[dict] = []
+   declared = None
+   malformed: list[tuple[int, str]] = []
+   desc_widths: set[int] = set()
+   for lineno, raw in enumerate(lines, 1):
+       line = raw.rstrip("\n").rstrip("\r")
+       footer = FOOTER_RE.match(line)
+       if footer:
+           declared = int(footer.group(1))
+           continue
+       if not ROW_RE.match(line):
+           continue                            
+       fields = [f.strip() for f in line.split("|")]
+       if len(fields) != len(COLUMNS):
+           malformed.append((lineno, line[:120]))
+           continue
+       row = dict(zip(COLUMNS, fields))
+       desc_widths.add(len(row["gdet_desc"]))
+       for key in NUMERIC:
+           value = _to_decimal(row[key])
+           if value is None:
+               malformed.append((lineno, line[:120]))
+               break
+           row[key] = value
+       else:
+           rows.append(row)
+   stats = {
+       "parsed_rows": len(rows),
+       "declared_rows": declared,
+       "malformed": malformed,
+       "max_desc_width": max(desc_widths) if desc_widths else 0,
+       "amount_sum": sum((r["gdet_amt"] for r in rows), Decimal(0)),
+   }
+   return rows, stats
+
+def check(stats: dict) -> list[str]:
+   """Integrity problems worth failing or alerting on."""
+   problems = []
+   if stats["declared_rows"] is None:
+       problems.append("No 'N rows selected.' footer - the spool may be truncated.")
+   elif stats["declared_rows"] != stats["parsed_rows"]:
+       problems.append(
+           f"Row count mismatch: spool declares {stats['declared_rows']}, "
+           f"parsed {stats['parsed_rows']}."
+       )
+   if stats["malformed"]:
+       problems.append(f"{len(stats['malformed'])} malformed row(s): {stats['malformed'][:3]}")
+   if stats["amount_sum"] != 0:
+       problems.append(
+           f"Amounts do not net to zero (sum={stats['amount_sum']}) - "
+           "expected for balanced double-entry extracts."
+       )
+   return problems
+
+def to_csv_text(rows: list[dict]) -> str:
+   buf = io.StringIO()
+   writer = csv.DictWriter(buf, fieldnames=COLUMNS, lineterminator="\n")
+   writer.writeheader()
+   for row in rows:
+       writer.writerow({k: (str(v) if v is not None else "") for k, v in row.items()})
+   return buf.getvalue()
+
+# =========================== run date ===========================
+def resolve_etl_compact(context) -> str:
+   """YYYYMMDD for this run, straight from bootstrap. Never from logical_date."""
+   ti = context["ti"]
+   raw = ti.xcom_pull(task_ids=BOOTSTRAP_DATE_TASK, key="formatted_date")
+   if raw and re.fullmatch(r"\d{8}", str(raw)):
+       return str(raw)
+   # fall back to the date object / dashed string pushed by the same task
+   for key in ("etl_date", "report_date"):
+       raw = ti.xcom_pull(task_ids=BOOTSTRAP_DATE_TASK, key=key)
+       if not raw:
+           continue
+       if hasattr(raw, "strftime"):
+           return raw.strftime("%Y%m%d")
+       for fmt in ("%d-%m-%Y", "%Y-%m-%d"):
+           try:
+               return datetime.strptime(str(raw)[:10], fmt).strftime("%Y%m%d")
+           except ValueError:
+               continue
+   raise ValueError(f"No usable ETL date in XCom from {BOOTSTRAP_DATE_TASK!r}")
+
+def row_filter_yymmdd(etl_compact: str) -> str:
+   """YYYYMMDD -> RRMMDD, to compare against each row's posting date."""
+   return etl_compact[2:]
+
+# =========================== oracle id generators ===========================
+def _oracle_scalar(sql: str):
+   row = get_oracle_hook().get_first(sql)
+   if not row or row[0] is None:
+       raise ValueError(f"No value returned by: {sql}")
+   return row[0]
+
+def next_batch_id() -> str:
+   """One batch id per run - shared by every record."""
+   return str(_oracle_scalar(BATCH_ID_SQL))
+
+class JournalIds:
+   """JOURNAL_ID per transaction: '<journal number>-<n>', n counting per branch.
+   One journal number is fetched from Oracle per distinct branch code, lazily.
+   Every call for that branch then returns the next suffix:
+       branch 06379 -> 9001-1, 9001-2, 9001-3 ...
+       branch 70495 -> 9002-1, 9002-2 ...
+   Call it exactly once per row written. The counter follows the journal
+   number, so a branch that appears in several files keeps counting.
+   """
+   def __init__(self, fetch=None):
+       self._fetch = fetch or (lambda: str(_oracle_scalar(JOURNAL_ID_SQL)))
+       self._journal: dict[str, str] = {}
+       self._count: dict[str, int] = {}
+   def __call__(self, branch_code: str) -> str:
+       if branch_code not in self._journal:
+           self._journal[branch_code] = self._fetch()
+           self._count[branch_code] = 0
+           log.info("Journal number %s allocated for branch %s",
+                    self._journal[branch_code], branch_code)
+       self._count[branch_code] += 1
+       return f"{self._journal[branch_code]}-{self._count[branch_code]}"
+   @property
+   def mapping(self) -> dict[str, str]:
+       """branch -> base journal number (without the -n suffix)."""
+       return dict(self._journal)
+   @property
+   def counts(self) -> dict[str, int]:
+       """branch -> transactions issued so far."""
+       return dict(self._count)
+
+# =========================== gl_transactions mapping ===========================
+def posting_yymmdd(refer: str) -> str:
+   """999999 - gdet_refer -> RRMMDD. 739185 -> 260814 (14-08-2026)."""
+   return f"{REFER_BASE - int(refer):06d}"
+
+def _invc_yymmdd(invc: str) -> str | None:
+   """BU14082026 -> 260814, for cross-checking the derived posting date."""
+   m = re.match(r"^BU(\d{2})(\d{2})(\d{4})$", invc)
+   if not m:
+       return None
+   day, month, year = m.groups()
+   return f"{year[2:]}{month}{day}"
+
+def split_amount(amount: Decimal) -> tuple[Decimal, Decimal]:
+   """(DEBIT_AMOUNT, CREDIT_AMOUNT) from GDET_AMT.
+   positive GDET_AMT -> DEBIT,  sign flipped negative   (+400  -> debit -400)
+   negative GDET_AMT -> CREDIT, sign flipped positive   (-400  -> credit 400)
+   The posted value is -GDET_AMT either way; only the column differs.
+   """
+   if amount > 0:
+       return -amount, Decimal(0)
+   if amount < 0:
+       return Decimal(0), -amount
+   return Decimal(0), Decimal(0)
+
+def _lit(value: str) -> str:
+   """Oracle string literal, single quotes doubled."""
+   return "'" + str(value).replace("'", "''") + "'"
+
+def to_insert_statements(rows: list[dict], batch_id: str,
+                        journal_for) -> tuple[list[str], list[str]]:
+   """Build one INSERT per row.
+   batch_id     - same for every record in the run
+   journal_for  - callable(branch_code) -> '<journal>-<n>', called once per row
+   Returns (statements, date_mismatches).
+   """
+   statements, mismatches = [], []
+   for row in rows:
+       yymmdd = posting_yymmdd(row["gdet_refer"])
+       from_invc = _invc_yymmdd(row["gdet_invc"])
+       if from_invc and from_invc != yymmdd:
+           mismatches.append(
+               f"{row['gdet_invc']}: refer {row['gdet_refer']} -> {yymmdd}, "
+               f"but invoice date is {from_invc}"
+           )
+       debit, credit = split_amount(row["gdet_amt"])
+       values = ", ".join([
+           f"{TARGET_SEQ}.NEXTVAL",
+           _lit(batch_id),
+           _lit(journal_for(row["gdet_entity"])),
+           f"to_date({_lit(yymmdd)}, 'RRMMDD')",
+           "sysdate",
+           _lit(row["gdet_entity"]),          # GDET_ENTITY -> BRANCH_CODE
+           _lit(row["gdet_curr"]),            # GDET_CURR   -> CURRENCY
+           _lit(row["gdet_acct"]),            # GDET_ACCT   -> CGL
+           _lit(row["gdet_desc"]),            # GDET_DESC   -> NARRATION
+           str(debit),
+           str(credit),
+           "null",                            # TRANSACTION_COUNT
+           _lit(SOURCE_FLAG),
+       ])
+       statements.append(
+           f"insert into {TARGET_TABLE} ({INSERT_COLUMNS}) values ({values});"
+       )
+   return statements, mismatches
+
+# =========================== staging server ===========================
+@contextmanager
+def _sftp():
+   conn = SFTPHook(ssh_conn_id=SFTP_CONN_ID).get_conn()
+   try:
+       yield conn
+   finally:
+       conn.close()
+
+def _ensure_dir(sftp, path: str) -> None:
+   built = ""
+   for part in path.strip("/").split("/"):
+       built = f"{built}/{part}"
+       try:
+           sftp.stat(built)
+       except IOError:
+           sftp.mkdir(built)
+
+def _spool_files(sftp, etl_compact: str) -> list:
+   """The one spool file for this ETL date, if present and non-empty."""
+   wanted = spool_filename(etl_compact).lower()
+   try:
+       entries = sftp.listdir_attr(SPOOL_DIR)
+   except IOError as exc:
+       log.info("Cannot list %s yet: %s", SPOOL_DIR, exc)
+       return []
+   return [a for a in entries
+           if a.filename.lower() == wanted
+           and stat.S_ISREG(a.st_mode) and a.st_size > 0]
+
+# =========================== control table (idempotency) ===========================
+CONTROL_TABLE = "datafix_control"
+_CONTROL_COLS = ("status", "source_sha256", "source_bytes", "sql_sha256", "batch_id", "row_count")
+NEW, REPARSE, SKIP_LOADED, CONFLICT = "NEW", "REPARSE", "SKIP_LOADED", "CONFLICT"
+_MERGE_SQL = f"""
+MERGE INTO {CONTROL_TABLE} t
+USING (SELECT TO_DATE(:etl, 'YYYYMMDD') AS etl_date, :src AS source_file FROM dual) s
+  ON (t.etl_date = s.etl_date AND t.source_file = s.source_file)
+WHEN MATCHED THEN UPDATE SET
+     t.source_sha256 = :sha, t.source_bytes = :bytes, t.sql_sha256 = :sqlsha,
+     t.status = 'PARSED', t.batch_id = :batch, t.row_count = :rc,
+     t.total_amount = :amt, t.parsed_at = SYSTIMESTAMP, t.loaded_at = NULL,
+     t.airflow_run_id = :run
+  WHERE t.status <> 'LOADED'
+WHEN NOT MATCHED THEN INSERT
+     (etl_date, source_file, source_sha256, source_bytes, sql_sha256, status,
+      batch_id, row_count, total_amount, parsed_at, airflow_run_id)
+     VALUES (s.etl_date, s.source_file, :sha, :bytes, :sqlsha, 'PARSED',
+      :batch, :rc, :amt, SYSTIMESTAMP, :run)
+"""
+
+def _control_get(etl_compact: str, source_file: str) -> dict | None:
+   row = get_oracle_hook().get_first(
+       f"SELECT {', '.join(_CONTROL_COLS)} FROM {CONTROL_TABLE} "
+       "WHERE etl_date = TO_DATE(:etl, 'YYYYMMDD') AND source_file = :src",
+       parameters={"etl": etl_compact, "src": source_file},
+   )
+   return dict(zip(_CONTROL_COLS, row)) if row else None
+
+def decide(existing: dict | None, source_sha: str) -> str:
+   """What to do with this file, given what the control table remembers.
+   NEW          no row yet
+   REPARSE      parsed earlier but never loaded - nothing posted, safe to redo
+   SKIP_LOADED  already loaded and the source is byte-identical - nothing to do
+   CONFLICT     already loaded but the source has changed - never auto-resolved
+   """
+   if existing is None:
+       return NEW
+   if existing["status"] == "LOADED":
+       return SKIP_LOADED if existing["source_sha256"] == source_sha else CONFLICT
+   return REPARSE
+
+def _control_save(etl_compact: str, source_file: str, *, sha: str, size: int,
+                 sql_sha: str, batch: str, rows: int, amount, run_id: str) -> None:
+   """Upsert as PARSED. The WHERE in the MERGE refuses to touch a LOADED row."""
+   conn = get_oracle_hook().get_conn()
+   try:
+       cur = conn.cursor()
+       cur.execute(_MERGE_SQL, {
+           "etl": etl_compact, "src": source_file, "sha": sha, "bytes": size,
+           "sqlsha": sql_sha, "batch": batch, "rc": rows, "amt": amount, "run": run_id,
+       })
+       affected = cur.rowcount
+       conn.commit()
+   finally:
+       conn.close()
+   if not affected:
+       raise RuntimeError(
+           f"Control row for {source_file} was not updated - it is probably LOADED. "
+           "Refusing to overwrite a loaded record."
+       )
+
+# =========================== sensor ===========================
+def wait_for_new_spool(quiet_seconds: int = 60, **context):
+   """True once this ETL date's spool file exists and has stopped growing.
+   Deliberately says nothing about whether it was processed already - that
+   decision belongs to the control table, inside parse_spool_files. Keeping it
+   there means rerunning a finished day is a clean no-op rather than a sensor
+   that waits out its whole timeout.
+   """
+   etl_compact = resolve_etl_compact(context)
+   with _sftp() as sftp:
+       found = _spool_files(sftp, etl_compact)
+   if not found:
+       log.info("%s not present in %s", spool_filename(etl_compact), SPOOL_DIR)
+       return False
+   age = time.time() - found[0].st_mtime
+   if age < quiet_seconds:
+       log.info("%s written %.0fs ago (< %ds), waiting",
+                found[0].filename, age, quiet_seconds)
+       return False
+   log.info("Ready: %s (%d bytes)", found[0].filename, found[0].st_size)
+   return True
+
+# =========================== stage callable ===========================
+def parse_spool_files(batch_id: str = None, fail_on_check: bool = True, **context):
+   """Parse this ETL date's spool file, keeping only rows posting to that date.
+   Idempotent. The control table decides: first time -> parse; parsed but not
+   loaded -> parse again and overwrite; loaded and unchanged -> do nothing;
+   loaded but the source changed -> fail. Nothing is recorded until every
+   check has passed, so a failed run never leaves a "done" marker behind.
+   """
+   etl_compact = resolve_etl_compact(context)           # YYYYMMDD
+   want_yymmdd = row_filter_yymmdd(etl_compact)         # RRMMDD, per-row filter
+   name = spool_filename(etl_compact)
+   run_id = context["run_id"]
+   with _sftp() as sftp:
+       found = _spool_files(sftp, etl_compact)
+       if not found:
+           raise FileNotFoundError(f"{name} not found in {SPOOL_DIR}")
+       with sftp.open(f"{SPOOL_DIR}/{found[0].filename}", "r") as fh:
+           fh.prefetch()                                 # without this, paramiko crawls
+           raw = fh.read()
+       raw = raw.encode("utf-8") if isinstance(raw, str) else raw
+       source_sha = hashlib.sha256(raw).hexdigest()
+       action = decide(_control_get(etl_compact, name), source_sha)
+       log.info("%s sha=%s... -> %s", name, source_sha[:12], action)
+       if action == SKIP_LOADED:
+           log.info("%s was already loaded and is unchanged - nothing to do.", name)
+           return {"action": action, "source": name, "source_sha256": source_sha}
+       if action == CONFLICT:
+           raise ValueError(
+               f"{name} changed after it was loaded (sha now {source_sha[:12]}...). "
+               "Reverse the earlier load by its batch id and clear the control row "
+               "before reprocessing - this is never done automatically."
+           )
+       # NEW or REPARSE: nothing for this file is in gl_transactions yet.
+       batch = batch_id or next_batch_id()
+       journals = JournalIds()
+       log.info("ETL date %s, keeping rows posting to %s. Batch id %s",
+                etl_compact, want_yymmdd, batch)
+       all_rows, stats = parse_spool(raw.decode("utf-8", errors="replace").splitlines())
+       problems = [f"{name}: {p}" for p in check(stats)]    # checks run on the FULL file
+       rows = [r for r in all_rows if posting_yymmdd(r["gdet_refer"]) == want_yymmdd]
+       dropped = len(all_rows) - len(rows)
+       log.info("%s: parsed=%s declared=%s kept=%s other-date=%s max_desc_width=%s sum=%s",
+                name, stats["parsed_rows"], stats["declared_rows"], len(rows), dropped,
+                stats["max_desc_width"], str(stats["amount_sum"]))
+       if not rows:
+           raise ValueError(f"{name}: no rows posting to {want_yymmdd} "
+                            f"({len(all_rows)} rows present for other dates)")
+       statements, mismatches = to_insert_statements(rows, batch, journals)
+       problems += [f"{name}: posting-date mismatch {m}" for m in mismatches]
+       for problem in problems:
+           log.warning(problem)
+       if problems and fail_on_check:
+           # Fail BEFORE writing any file or control row.
+           raise ValueError(f"Spool integrity problems: {problems[:5]}")
+       # ---- everything validated: write outputs, then record as the last step ----
+       stem = SPOOL_RE.match(name).group("stem")
+       _ensure_dir(sftp, PARSED_DIR)
+       csv_path = f"{PARSED_DIR}/{stem}_parsed.csv"
+       sql_path = f"{PARSED_DIR}/{stem}.sql"
+       sql_text = "\n".join(statements) + "\n"
+       with sftp.open(csv_path, "w") as fh:
+           fh.write(to_csv_text(rows))
+       with sftp.open(sql_path, "w") as fh:
+           fh.write(sql_text)
+           log.info("Wrote %s (%d rows) and %s (%d inserts)",
+                csv_path, len(rows), sql_path, len(statements))
+       log.info("First insert:\n%s", statements[0])
+   _control_save(
+       etl_compact, name,
+       sha=source_sha, size=len(raw),
+       sql_sha=hashlib.sha256(sql_text.encode("utf-8")).hexdigest(),
+       batch=batch, rows=len(rows), amount=stats["amount_sum"], run_id=run_id,
+   )
+   log.info("Control row saved: %s PARSED batch=%s rows=%d", name, batch, len(rows))
+   log.info("Journal numbers by branch: %s", str(journals.mapping))
+   log.info("Transactions per branch: %s", str(journals.counts))
+   return {
+       "action": action,
+       "source": name,
+       "batch_id": batch,
+       "journal_ids": journals.mapping,
+       "journal_txn_counts": journals.counts,
+       "csv": csv_path,
+       "sql": sql_path,
+       "parsed_rows": stats["parsed_rows"],
+       "kept_rows": len(rows),
+       "other_date_rows": dropped,
+       "amount_sum": str(stats["amount_sum"]),
+       "problems": problems,
+   }
+
+
+def load_spool_sql(fail_on_check: bool = True, **context):
+    """Execute the parsed SQL file against gl_transactions, then mark LOADED.
+    Idempotent: if the control row is already LOADED with matching SHA, no-op.
+    """
+    etl_compact = resolve_etl_compact(context)
+    run_id = context["run_id"]
+    name = spool_filename(etl_compact)
+
+    # 1. Read control row
+    existing = _control_get(etl_compact, name)
+    if existing is None:
+        raise ValueError(f"No control row for {name} - run parse first.")
+
+    # 2. Already loaded?
+    if existing["status"] == "LOADED":
+        log.info("%s already LOADED - nothing to do.", name)
+        return {"action": "SKIP_LOADED", "source": name}
+
+    # 3. Verify SQL file on disk matches what parse recorded
+    with _sftp() as sftp:
+        stem = SPOOL_RE.match(name).group("stem")
+        sql_path = f"{PARSED_DIR}/{stem}.sql"
+        with sftp.open(sql_path, "r") as fh:
+            fh.prefetch()
+            sql_text = fh.read()
+
+    # Paramiko SFTP always returns bytes, even in "r" mode
+    if isinstance(sql_text, bytes):
+        sql_text = sql_text.decode("utf-8")
+
+    file_sha = hashlib.sha256(sql_text.encode("utf-8")).hexdigest()
+    if existing["sql_sha256"] and file_sha != existing["sql_sha256"]:
+        raise ValueError(
+            f"SQL file {sql_path} sha {file_sha[:12]}... != control row "
+            f"{existing['sql_sha256'][:12]}... - file changed after parse. "
+            "Re-run parse to regenerate."
+        )
+
+    # 4. Guard against double-load: check if batch rows already exist
+    batch_id = existing["batch_id"]
+    conn = get_oracle_hook().get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT COUNT(*) FROM {TARGET_TABLE} "
+            "WHERE BATCH_ID = :b AND TRANSACTION_DATE = TO_DATE(:etl, 'YYYYMMDD')",
+            {"b": batch_id, "etl": etl_compact},
+        )
+        already_loaded = cur.fetchone()[0]
+        if already_loaded > 0:
+            log.warning(
+                "%s: %d rows already in %s for batch %s - "
+                "SQL file was executed but control row not updated. "
+                "Marking LOADED without re-executing.",
+                name, already_loaded, TARGET_TABLE, batch_id,
+            )
+            _mark_loaded(etl_compact, name, batch_id, already_loaded, run_id)
+            return {"action": "RECOVERED", "source": name, "rows": already_loaded}
+
+        # 5. Execute the SQL statements
+        raw_statements = re.split(r';\s*', sql_text.strip())
+        statements = [
+    s for s in raw_statements 
+    if s.lower().startswith("insert")
+]  
+        log.info("Executing %d INSERT statements from %s", len(statements), sql_path)
+        log.info(statements)
+        for i, stmt in enumerate(statements, 1):
+            log.info(f"{i} ----- > {stmt}")
+            cur.execute(stmt)
+            if i % 500 == 0:
+                log.info("  %d/%d", i, len(statements))
+        conn.commit()
+        rows_loaded = len(statements)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    # 6. Mark LOADED (last step — if this fails, next run re-executes)
+    _mark_loaded(etl_compact, name, batch_id, rows_loaded, run_id)
+    log.info("%s LOADED: %d rows, batch=%s", name, rows_loaded, batch_id)
+    return {
+        "action": "LOADED",
+        "source": name,
+        "batch_id": batch_id,
+        "rows_loaded": rows_loaded,
+    }   
+
+
+def _mark_loaded(etl_compact: str, source_file: str, batch_id: str,
+                rows: int, run_id: str) -> None:
+    conn = get_oracle_hook().get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE {CONTROL_TABLE} "
+            "SET status = 'LOADED', loaded_at = SYSTIMESTAMP, "
+            "    airflow_run_id = :run "
+            "WHERE etl_date = TO_DATE(:etl, 'YYYYMMDD') "
+            "  AND source_file = :src "
+            "  AND status = 'PARSED'",
+            {"etl": etl_compact, "src": source_file, "run": run_id},
+        )
+        if cur.rowcount == 0:
+            raise RuntimeError(
+                f"Could not mark {source_file} LOADED - row missing or not PARSED."
+            )
+        conn.commit()
+    finally:
+        conn.close()   
+
+
+# =========================== DAG ===========================
+with DAG(
+   dag_id="gdet_spool_dag",
+   start_date=datetime(2024, 1, 1),
+   catchup=False,
+   max_active_runs=1
+) as dag:
+   bootstrap = bootstrap_process_group(dag=dag, process_id=Process.CONTROL_PIPELINE)
+   wait_spools = stage_wrapper(
+       dag=dag,
+       stage_id="wait_for_new_spool",
+       operator_cls=PythonSensor,
+       operator_kwargs={
+           "python_callable": wait_for_new_spool,
+           "op_kwargs": {"quiet_seconds": 60},
+           "mode": "reschedule",
+           "poke_interval": timedelta(minutes=2),
+           "timeout": timedelta(hours=8),
+       },
+       stage_meta={"type": "SENSOR", "label": "Wait for new GDET spool files"},
+   )
+   parse_spools = stage_wrapper(
+       dag=dag,
+       stage_id="parse_gdet_spools",
+       operator_cls=PythonOperator,
+       operator_kwargs={
+           "python_callable": parse_spool_files,
+           "op_kwargs": {"batch_id": None, "fail_on_check": True},
+       },
+       stage_meta={"type": "PYTHON", "label": "Parse GDET spool extracts"},
+   )
+   mark_process_failure = PythonOperator(
+       task_id="end_process_failure",
+       python_callable=fail_process_run,
+       trigger_rule=TriggerRule.ONE_SUCCESS,
+   )
+   mark_process_success = PythonOperator(
+       task_id="end_process_success",
+       python_callable=end_process_success,
+       trigger_rule=TriggerRule.ALL_SUCCESS,
+   )
+   
+   load_spools = stage_wrapper(
+    dag=dag,
+    stage_id="load_gdet_spools",
+    operator_cls=PythonOperator,
+    operator_kwargs={
+        "python_callable": load_spool_sql,
+        "op_kwargs": {"fail_on_check": True},
+        "retries": 1,          # safe: the batch-id guard prevents double-insert
+        "retry_delay": timedelta(minutes=2),
+    },
+    stage_meta={"type": "PYTHON", "label": "Load parsed SQL into gl_transactions"},
+)
+
+
+   
+   
+   bootstrap >> wait_spools
+   [wait_spools.stage_success] >> parse_spools
+   [parse_spools.stage_success] >> load_spools
+   [load_spools.stage_success] >> mark_process_success
+   for stage in (wait_spools, parse_spools , load_spools):
+       [stage.stage_failure] >> mark_process_failure
+       
+       
+       
