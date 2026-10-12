@@ -19,6 +19,13 @@ from utils.oracle_util import get_oracle_hook
 from utils.process_run_util import end_process_success, fail_process_run
 from utils.wrapper_util import stage_wrapper
 from constants.process import Process
+import re, tempfile
+from datetime import datetime, timedelta
+from airflow.sdk import Asset, AssetWatcher, dag, task
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowException
+from airflow.providers.sftp.hooks.sftp import SFTPHook
+from triggers.sftp_trigger import SFTPFileEventTrigger
 log = logging.getLogger(__name__)
 # =========================== config ===========================
 SFTP_CONN_ID = "sftp"
@@ -32,18 +39,13 @@ INSERT_COLUMNS = (
    "TRANSACTION_ID,BATCH_ID,JOURNAL_ID,TRANSACTION_DATE,POST_DATE,BRANCH_CODE,"
    "CURRENCY,CGL,NARRATION,DEBIT_AMOUNT,CREDIT_AMOUNT,TRANSACTION_COUNT,SOURCE_FLAG"
 )
-REFER_BASE = 999999        # posting date yymmdd = REFER_BASE - gdet_refer
-# Oracle id generators. Zero-arg functions are called without parentheses in SQL;
-# add them (and bind parameters) here if the signatures differ.
+REFER_BASE = 999999
 BATCH_ID_SQL = "SELECT get_next_batch_id FROM dual"
 JOURNAL_ID_SQL = "SELECT get_next_journal_id FROM dual"
-# Only the file for this run's ETL date: fix_YYYYMMDD.txt
 SPOOL_RE = re.compile(r"^(?P<stem>fix_(?P<date>\d{8}))\.txt$", re.IGNORECASE)
-
 def spool_filename(etl_compact: str) -> str:
    return f"fix_{etl_compact}.txt"
 
-# bootstrap_process pushes formatted_date as %Y%m%d - exactly the filename form.
 BOOTSTRAP_DATE_TASK = "bootstrap_process.fetch_fincore_etl_date"
 COLUMNS = [
    "gdet_invc",
@@ -583,70 +585,122 @@ def _mark_loaded(etl_compact: str, source_file: str, batch_id: str,
         conn.close()   
 
 
-# =========================== DAG ===========================
-with DAG(
-   dag_id="gdet_spool_dag",
-   start_date=datetime(2024, 1, 1),
-   catchup=False,
-   max_active_runs=1
-) as dag:
-   bootstrap = bootstrap_process_group(dag=dag, process_id=Process.CONTROL_PIPELINE)
-   wait_spools = stage_wrapper(
-       dag=dag,
-       stage_id="wait_for_new_spool",
-       operator_cls=PythonSensor,
-       operator_kwargs={
-           "python_callable": wait_for_new_spool,
-           "op_kwargs": {"quiet_seconds": 60},
-           "mode": "reschedule",
-           "poke_interval": timedelta(minutes=2),
-           "timeout": timedelta(hours=8),
-       },
-       stage_meta={"type": "SENSOR", "label": "Wait for new GDET spool files"},
-   )
-   parse_spools = stage_wrapper(
-       dag=dag,
-       stage_id="parse_gdet_spools",
-       operator_cls=PythonOperator,
-       operator_kwargs={
-           "python_callable": parse_spool_files,
-           "op_kwargs": {"batch_id": None, "fail_on_check": True},
-       },
-       stage_meta={"type": "PYTHON", "label": "Parse GDET spool extracts"},
-   )
-   mark_process_failure = PythonOperator(
-       task_id="end_process_failure",
-       python_callable=fail_process_run,
-       trigger_rule=TriggerRule.ONE_SUCCESS,
-   )
-   mark_process_success = PythonOperator(
-       task_id="end_process_success",
-       python_callable=end_process_success,
-       trigger_rule=TriggerRule.ALL_SUCCESS,
-   )
-   
-   load_spools = stage_wrapper(
-    dag=dag,
-    stage_id="load_gdet_spools",
-    operator_cls=PythonOperator,
-    operator_kwargs={
-        "python_callable": load_spool_sql,
-        "op_kwargs": {"fail_on_check": True},
-        "retries": 1,          # safe: the batch-id guard prevents double-insert
-        "retry_delay": timedelta(minutes=2),
-    },
-    stage_meta={"type": "PYTHON", "label": "Load parsed SQL into gl_transactions"},
+
+
+CONN = "sftp"
+SPOOL_PATH = "/media/FinCore/datafix"
+
+
+trigger = SFTPFileEventTrigger(
+   path=SPOOL_PATH,
+   file_pattern="fix_{etl_date}.txt",   # plain string, no f prefix
+   date_format="%Y%m%d",
+   etl_date_sql="SELECT TO_CHAR(etl_date, 'YYYYMMDD') FROM fincore_date",
+   oracle_conn_id="oracle_conn",        # whatever exists in Admin → Connections
+   sftp_conn_id="sftp",
 )
 
 
-   
-   
-   bootstrap >> wait_spools
-   [wait_spools.stage_success] >> parse_spools
-   [parse_spools.stage_success] >> load_spools
-   [load_spools.stage_success] >> mark_process_success
-   for stage in (wait_spools, parse_spools , load_spools):
-       [stage.stage_failure] >> mark_process_failure
-       
-       
+sftp_asset = Asset(
+    "gdet_datafix_inbound",
+    watchers=[AssetWatcher(name="gdet_datafix_watcher", trigger=trigger)],
+)
+
+def _collect_files(**context):
+    files = set()
+    for ev in context["triggering_asset_events"][sftp_asset]:
+        p = ev.extra["payload"]
+        files.update(f"{p['path']}/{f}" for f in p["files"])
+    return sorted(files)
+
+
+def _mark_done(**context):
+   files = []
+   for ev in context["triggering_asset_events"][sftp_asset]:
+       p = ev.extra["payload"]
+       files += [f"{p['path']}/{f}" for f in p["files"]]
+   if not files:
+       raise AirflowException("No files found in triggering asset event")
+   hook = SFTPHook(ssh_conn_id=SFTP_CONN_ID)
+   with tempfile.NamedTemporaryFile() as empty:
+       for remote in files:
+           hook.store_file(remote + ".done", empty.name)
+           hook.delete_file(remote + ".inprogress")
+
+
+with DAG(
+    dag_id="gdet_spool_dag",
+    schedule=[sftp_asset],
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    max_active_runs=1,
+) as dag:
+
+    bootstrap = bootstrap_process_group(dag=dag, process_id=Process.DATAFIX_PIPELINE)
+
+    collect = stage_wrapper(
+        dag=dag,
+        stage_id="collect_inbound_files",
+        operator_cls=PythonOperator,
+        operator_kwargs={
+            "python_callable": _collect_files,
+        },
+        stage_meta={"type": "PYTHON", "label": "Collect SFTP trigger payload"},
+    )
+
+    parse_spools = stage_wrapper(
+        dag=dag,
+        stage_id="parse_gdet_spools",
+        operator_cls=PythonOperator,
+        operator_kwargs={
+            "python_callable": parse_spool_files,
+            "op_kwargs": {"batch_id": None, "fail_on_check": True},
+        },
+        stage_meta={"type": "PYTHON", "label": "Parse GDET spool extracts"},
+    )
+
+    load_spools = stage_wrapper(
+        dag=dag,
+        stage_id="load_gdet_spools",
+        operator_cls=PythonOperator,
+        operator_kwargs={
+            "python_callable": load_spool_sql,
+            "op_kwargs": {"fail_on_check": True},
+            "retries": 1,
+            "retry_delay": timedelta(minutes=2),
+        },
+        stage_meta={"type": "PYTHON", "label": "Load parsed SQL into gl_transactions"},
+    )
+
+    mark_done = stage_wrapper(
+        dag=dag,
+        stage_id="mark_files_done",
+        operator_cls=PythonOperator,
+        operator_kwargs={
+            "python_callable": _mark_done,
+            "op_kwargs": {"files": None},  # passed via XCom from collect
+        },
+        stage_meta={"type": "PYTHON", "label": "Write .done / remove .inprogress"},
+    )
+
+    mark_process_failure = PythonOperator(
+        task_id="end_process_failure",
+        python_callable=fail_process_run,
+        trigger_rule=TriggerRule.ONE_SUCCESS,
+    )
+    mark_process_success = PythonOperator(
+        task_id="end_process_success",
+        python_callable=end_process_success,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+    )
+
+    # --- DAG edges (same pattern as before) ---
+    bootstrap >> collect
+    [collect.stage_success] >> parse_spools
+    [parse_spools.stage_success] >> load_spools
+    [load_spools.stage_success] >> mark_done
+    [mark_done.stage_success] >> mark_process_success
+
+    for stage in (collect, parse_spools, load_spools, mark_done):
+        [stage.stage_failure] >> mark_process_failure
        
